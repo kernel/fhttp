@@ -18,7 +18,7 @@ import (
 
 	tls "github.com/bogdanfinn/utls"
 
-	"github.com/bogdanfinn/fhttp/internal"
+	"github.com/kernel/fhttp/internal"
 )
 
 // Issue 15446: incorrect wrapping of errors when server closes an idle connection.

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	http "github.com/bogdanfinn/fhttp"
+	http "github.com/kernel/fhttp"
 )
 
 // throttledSink caps the rate at which a response body is consumed, simulating
