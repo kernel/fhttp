@@ -33,10 +33,10 @@ import (
 
 	tls "github.com/bogdanfinn/utls"
 
-	http "github.com/bogdanfinn/fhttp"
-	"github.com/bogdanfinn/fhttp/http2/hpack"
-	"github.com/bogdanfinn/fhttp/httptest"
-	"github.com/bogdanfinn/fhttp/httptrace"
+	http "github.com/kernel/fhttp"
+	"github.com/kernel/fhttp/http2/hpack"
+	"github.com/kernel/fhttp/httptest"
+	"github.com/kernel/fhttp/httptrace"
 )
 
 var (
