@@ -22,11 +22,12 @@ type DebugEvent struct {
 	ErrorCode     ErrCode
 	Error         error
 	ErrorDetail   error
+	DebugData     string
 }
 
 var nextClientConnID uint64
 
-func (cc *ClientConn) debugEvent(kind, frameType string, streamID uint32, code ErrCode, err, detail error) {
+func (cc *ClientConn) debugEvent(kind, frameType string, streamID uint32, code ErrCode, err, detail error, debugData string) {
 	if cc.t.DebugLog == nil {
 		return
 	}
@@ -52,6 +53,7 @@ func (cc *ClientConn) debugEvent(kind, frameType string, streamID uint32, code E
 		ErrorCode:     code,
 		Error:         err,
 		ErrorDetail:   detail,
+		DebugData:     debugData,
 	})
 }
 

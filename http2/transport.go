@@ -2144,9 +2144,9 @@ func (rl *clientConnReadLoop) run() error {
 			cc.vlogf("http2: Transport readFrame error on conn %p: (%T) %v", cc, err, err)
 			var se StreamError
 			if errors.As(err, &se) {
-				cc.debugEvent("read_error", "", se.StreamID, se.Code, err, cc.fr.ErrorDetail())
+				cc.debugEvent("read_error", "", se.StreamID, se.Code, err, cc.fr.ErrorDetail(), "")
 			} else {
-				cc.debugEvent("read_error", "", 0, 0, err, cc.fr.ErrorDetail())
+				cc.debugEvent("read_error", "", 0, 0, err, cc.fr.ErrorDetail(), "")
 			}
 		}
 		if se, ok := err.(StreamError); ok {
@@ -2690,7 +2690,7 @@ func (cs *clientStream) copyTrailers() {
 
 func (rl *clientConnReadLoop) processGoAway(f *GoAwayFrame) error {
 	cc := rl.cc
-	cc.debugEvent("peer_goaway", f.Header().Type.String(), f.LastStreamID, f.ErrCode, nil, nil)
+	cc.debugEvent("peer_goaway", f.Header().Type.String(), f.LastStreamID, f.ErrCode, nil, nil, string(f.DebugData()))
 	cc.t.connPool().MarkDead(cc)
 	if f.ErrCode != 0 {
 		// TODO: deal with GOAWAY more. particularly the error code
@@ -2791,7 +2791,7 @@ func (rl *clientConnReadLoop) processWindowUpdate(f *WindowUpdateFrame) error {
 
 func (rl *clientConnReadLoop) processResetStream(f *RSTStreamFrame) error {
 	cc := rl.cc
-	cc.debugEvent("peer_stream_reset", f.Header().Type.String(), f.StreamID, f.ErrCode, streamError(f.StreamID, f.ErrCode), nil)
+	cc.debugEvent("peer_stream_reset", f.Header().Type.String(), f.StreamID, f.ErrCode, streamError(f.StreamID, f.ErrCode), nil, "")
 	cs := cc.streamByID(f.StreamID, true)
 	if cs == nil {
 		// TODO: return error if server tries to RST_STEAM an idle stream
