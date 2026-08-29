@@ -2441,14 +2441,7 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	var connAdd, streamAdd int32
-
-	// Check the conn-level first, before the stream-level.
-	// Use dynamic connFlow logic
-	if v := cc.inflow.available(); v < int32(cc.connFlow/2) {
-		connAdd = int32(cc.connFlow) - v
-		cc.inflow.add(connAdd)
-	}
+	var streamAdd int32
 
 	if err == nil {
 		// Consider any buffered body data (read from the conn but not
@@ -2483,15 +2476,10 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 		}
 	}
 
-	if connAdd != 0 || streamAdd != 0 {
+	if streamAdd != 0 {
 		cc.wmu.Lock()
 		defer cc.wmu.Unlock()
-		if connAdd != 0 {
-			cc.fr.WriteWindowUpdate(0, mustUint31(connAdd))
-		}
-		if streamAdd != 0 {
-			cc.fr.WriteWindowUpdate(cs.ID, mustUint31(streamAdd))
-		}
+		cc.fr.WriteWindowUpdate(cs.ID, mustUint31(streamAdd))
 		cc.bw.Flush()
 	}
 
@@ -2505,20 +2493,12 @@ func (b transportResponseBody) Close() error {
 	cc := cs.cc
 
 	serverSentStreamEnd := cs.bufPipe.Err() == io.EOF
-	unread := cs.bufPipe.Len()
 
-	if unread > 0 || !serverSentStreamEnd {
+	if !serverSentStreamEnd {
 		cc.mu.Lock()
 		cc.wmu.Lock()
-		if !serverSentStreamEnd {
-			cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
-			cs.didReset = true
-		}
-		// Return connection-level flow control.
-		if unread > 0 {
-			cc.inflow.add(int32(unread))
-			cc.fr.WriteWindowUpdate(0, uint32(unread))
-		}
+		cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
+		cs.didReset = true
 		cc.bw.Flush()
 		cc.wmu.Unlock()
 		cc.mu.Unlock()
@@ -2627,6 +2607,16 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 
 				return err
 			}
+
+			// Return connection-level flow control once the DATA is buffered.
+			// Stream-level flow control remains tied to body reads below.
+			cc.mu.Lock()
+			cc.inflow.add(int32(len(data)))
+			cc.wmu.Lock()
+			cc.fr.WriteWindowUpdate(0, uint32(len(data)))
+			cc.bw.Flush()
+			cc.wmu.Unlock()
+			cc.mu.Unlock()
 		}
 	}
 

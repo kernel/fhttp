@@ -2811,11 +2811,13 @@ func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 		// - Send one DATA frame with 5000 bytes.
 		// - Send two DATA frames with 1 and 4999 bytes each.
 		//
-		// In both cases, the client should consume one byte of data,
-		// refund that byte, then refund the following 4999 bytes.
+		// In both cases, the client should return all 5000 bytes of
+		// connection-level flow control. The first case returns the credit
+		// when the data is buffered; the second also returns the data received
+		// after the stream has been reset.
 		//
 		// In the second case, the server waits for the client connection to
-		// close before seconding the second DATA frame. This tests the case
+		// close before sending the second DATA frame. This tests the case
 		// where the client receives a DATA frame after it has reset the stream.
 		if oneDataFrame {
 			ct.fr.WriteData(hf.StreamID, false /* don't end stream */, make([]byte, 5000))
@@ -2828,28 +2830,29 @@ func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 			ct.fr.WriteData(hf.StreamID, false /* don't end stream */, make([]byte, 4999))
 		}
 
-		waitingFor := "RSTStreamFrame"
-		for {
+		var gotReset bool
+		var gotWindowUpdate uint32
+		for !gotReset || gotWindowUpdate < 5000 {
 			f, err := ct.fr.ReadFrame()
 			if err != nil {
-				return fmt.Errorf("ReadFrame while waiting for %s: %v", waitingFor, err)
+				return fmt.Errorf("ReadFrame while waiting for flow-control cleanup: %v", err)
 			}
 			if _, ok := f.(*SettingsFrame); ok {
 				continue
 			}
-			switch waitingFor {
-			case "RSTStreamFrame":
-				if rf, ok := f.(*RSTStreamFrame); !ok || rf.ErrCode != ErrCodeCancel {
-					return fmt.Errorf("Expected a RSTStreamFrame with code cancel; got %v", summarizeFrame(f))
+			switch f := f.(type) {
+			case *RSTStreamFrame:
+				if f.ErrCode != ErrCodeCancel {
+					return fmt.Errorf("expected a RSTStreamFrame with code cancel; got %v", summarizeFrame(f))
 				}
-				waitingFor = "WindowUpdateFrame"
-			case "WindowUpdateFrame":
-				if wuf, ok := f.(*WindowUpdateFrame); !ok || wuf.Increment != 4999 {
-					return fmt.Errorf("Expected WindowUpdateFrame for 4999 bytes; got %v", summarizeFrame(f))
+				gotReset = true
+			case *WindowUpdateFrame:
+				if f.StreamID == 0 {
+					gotWindowUpdate += f.Increment
 				}
-				return nil
 			}
 		}
+		return nil
 	}
 	ct.run()
 }
