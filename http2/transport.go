@@ -324,6 +324,7 @@ type ClientConn struct {
 	idleTimer   *time.Timer
 
 	inflow            inflow // peer's conn-level flow control
+	unsentConnRefund  int32  // conn-level credit not yet announced with a WINDOW_UPDATE; guarded by mu
 	initialWindowSize uint32
 
 	lastActive           time.Time
@@ -932,6 +933,24 @@ func (cc *ClientConn) CanTakeNewRequest() bool {
 	defer cc.mu.Unlock()
 
 	return cc.canTakeNewRequestLocked()
+}
+
+// BufferedUnreadBytes returns the number of response DATA bytes buffered by
+// this connection's streams but not yet consumed by Response.Body reads.
+// Connection-level flow control is refunded once DATA is buffered, so this
+// memory is bounded per stream by its window but no longer bounded per
+// connection; callers can export the sum as a gauge to watch for unread
+// bodies accumulating.
+func (cc *ClientConn) BufferedUnreadBytes() int64 {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	var n int64
+	for _, cs := range cc.streams {
+		n += int64(cs.bufPipe.Len())
+	}
+
+	return n
 }
 
 // clientConnIdleState describes the suitability of a client
@@ -2436,28 +2455,18 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	// Credit every byte the application consumes back to the flow control
-	// windows. The inflow accounting batches wire updates (at least
-	// inflowMinRefresh bytes, or enough to at least double the peer's
-	// remaining window), and unlike a threshold refresh it conserves
-	// credit exactly: bytes read from a body that is closed shortly after
-	// are still refunded by the next stream's reads instead of stranding
-	// until the connection window strangles to zero.
-	connAdd := cc.inflow.add(n)
+	// Credit bytes consumed by the application back to the stream-level
+	// flow-control window. Connection-level credit is refunded when DATA is
+	// buffered, so it must not be refunded again here.
 	var streamAdd int32
 	if err == nil { // No need to refresh if the stream is over or failed.
 		streamAdd = cs.inflow.add(n)
 	}
 
-	if connAdd != 0 || streamAdd != 0 {
+	if streamAdd != 0 {
 		cc.wmu.Lock()
 		defer cc.wmu.Unlock()
-		if connAdd != 0 {
-			cc.fr.WriteWindowUpdate(0, mustUint31(connAdd))
-		}
-		if streamAdd != 0 {
-			cc.fr.WriteWindowUpdate(cs.ID, mustUint31(streamAdd))
-		}
+		cc.fr.WriteWindowUpdate(cs.ID, mustUint31(streamAdd))
 		cc.bw.Flush()
 	}
 
@@ -2466,35 +2475,40 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 
 var errClosedResponseBody = errors.New("http2: response body closed")
 
+// refundConnFlow returns n bytes of connection-level flow control credit.
+// Every byte taken from the connection window is refunded exactly once:
+// padding and data for reset or unknown streams are refunded as the frame is
+// processed, and response data is refunded once buffered in the stream's
+// pipe. Refunds accumulate in cc.unsentConnRefund and are only announced to
+// the peer once they reach half the connection window, matching the
+// refresh-below-half cadence browsers use; cc.inflow tracks the window as
+// announced. It returns the increment to send in a stream-0 WINDOW_UPDATE,
+// or 0 if the refund was buffered.
+//
+// cc.mu must be held.
+func (cc *ClientConn) refundConnFlow(n int32) int32 {
+	cc.unsentConnRefund += n
+	if cc.unsentConnRefund < int32(cc.connFlow/2) {
+		return 0
+	}
+	send := cc.unsentConnRefund
+	cc.unsentConnRefund = 0
+	cc.inflow.add(int(send))
+
+	return send
+}
+
 func (b transportResponseBody) Close() error {
 	cs := b.cs
 	cc := cs.cc
 
 	serverSentStreamEnd := cs.bufPipe.Err() == io.EOF
 
-	// Break the pipe before returning flow control credit for unread data.
-	// Pipe writes fail from here on, so no data can land in the pipe (and
-	// silently lose its connection-level credit) between the refund below and
-	// the break. See golang.org/x/net commit 9f24bb44.
-	cs.bufPipe.BreakWithError(errClosedResponseBody)
-
-	unread := cs.bufPipe.Len()
-
-	if unread > 0 || !serverSentStreamEnd {
+	if !serverSentStreamEnd {
 		cc.mu.Lock()
-		var connAdd int32
-		if unread > 0 {
-			// Return connection-level flow control.
-			connAdd = cc.inflow.add(unread)
-		}
 		cc.wmu.Lock()
-		if !serverSentStreamEnd {
-			cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
-			cs.didReset = true
-		}
-		if connAdd > 0 {
-			cc.fr.WriteWindowUpdate(0, uint32(connAdd))
-		}
+		cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
+		cs.didReset = true
 		cc.bw.Flush()
 		cc.wmu.Unlock()
 		cc.mu.Unlock()
@@ -2530,7 +2544,7 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		if f.Length > 0 {
 			cc.mu.Lock()
 			ok := cc.inflow.take(f.Length)
-			connAdd := cc.inflow.add(int(f.Length))
+			connAdd := cc.refundConnFlow(int32(f.Length))
 			cc.mu.Unlock()
 			if !ok {
 				return ConnectionError(ErrCodeFlowControl)
@@ -2596,18 +2610,21 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		if didReset {
 			refund += len(data)
 		}
-
-		sendConn := cc.inflow.add(refund)
+		connRefund := refund
+		if len(data) > 0 && !didReset {
+			connRefund += len(data)
+		}
+		connAdd := cc.refundConnFlow(int32(connRefund))
 		var sendStream int32
 		if !didReset {
 			sendStream = cs.inflow.add(refund)
 		}
 		cc.mu.Unlock()
 
-		if sendConn > 0 || sendStream > 0 {
+		if connAdd > 0 || sendStream > 0 {
 			cc.wmu.Lock()
-			if sendConn > 0 {
-				cc.fr.WriteWindowUpdate(0, uint32(sendConn))
+			if connAdd > 0 {
+				cc.fr.WriteWindowUpdate(0, uint32(connAdd))
 			}
 			if sendStream > 0 {
 				cc.fr.WriteWindowUpdate(cs.ID, uint32(sendStream))
