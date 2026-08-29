@@ -80,12 +80,8 @@ func (p *pipe) Write(d []byte) (n int, err error) {
 		p.c.L = &p.mu
 	}
 	defer p.c.Signal()
-	if p.err != nil {
+	if p.err != nil || p.breakErr != nil {
 		return 0, errClosedPipeWrite
-	}
-	if p.breakErr != nil {
-		p.unread += len(d)
-		return len(d), nil // discard when there is no reader
 	}
 	// pipe.setBuffer is never invoked, leaving the buffer uninitialized.
 	// We shouldn't try to write to an uninitialized pipe,
