@@ -16,6 +16,11 @@ import (
 // TestTransportPausedBodiesDoNotExhaustConnectionWindow verifies that response
 // bodies which stop being read do not prevent other streams from making
 // progress once their DATA has been buffered.
+//
+// The three paused bodies need more connection credit than the window holds,
+// so before connection-level credit was refunded at buffer time this test
+// failed with "paused bodies did not fill their stream windows": buffering
+// itself stalled once the connection window ran dry.
 func TestTransportPausedBodiesDoNotExhaustConnectionWindow(t *testing.T) {
 	const (
 		streamWindow = 6 << 20
@@ -94,6 +99,7 @@ func TestTransportPausedBodiesDoNotExhaustConnectionWindow(t *testing.T) {
 	for {
 		cc.mu.Lock()
 		available := cc.inflow.available()
+		pending := cc.unsentConnRefund
 		streams := make([]*clientStream, 0, len(cc.streams))
 		for _, cs := range cc.streams {
 			streams = append(streams, cs)
@@ -102,14 +108,19 @@ func TestTransportPausedBodiesDoNotExhaustConnectionWindow(t *testing.T) {
 
 		allBuffered := len(streams) == 3
 		for _, cs := range streams {
+			if cs.bufPipe.Len() > streamWindow {
+				t.Fatalf("stream buffered %d bytes, more than its %d byte window", cs.bufPipe.Len(), streamWindow)
+			}
 			if cs.bufPipe.Len() < streamWindow {
 				allBuffered = false
 				break
 			}
 		}
 		if allBuffered {
-			if available < connWindow {
-				t.Fatalf("paused bodies reduced connection window: available=%d, want at least %d", available, connWindow)
+			// Refunds may still be batched in unsentConnRefund rather than
+			// added to the announced window; both count as returned credit.
+			if available+pending < connWindow {
+				t.Fatalf("paused bodies reduced connection window: available=%d pending=%d, want at least %d", available, pending, connWindow)
 			}
 			break
 		}
