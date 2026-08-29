@@ -2472,29 +2472,11 @@ func (b transportResponseBody) Close() error {
 
 	serverSentStreamEnd := cs.bufPipe.Err() == io.EOF
 
-	// Break the pipe before returning flow control credit for unread data.
-	// Pipe writes fail from here on, so no data can land in the pipe (and
-	// silently lose its connection-level credit) between the refund below and
-	// the break. See golang.org/x/net commit 9f24bb44.
-	cs.bufPipe.BreakWithError(errClosedResponseBody)
-
-	unread := cs.bufPipe.Len()
-
-	if unread > 0 || !serverSentStreamEnd {
+	if !serverSentStreamEnd {
 		cc.mu.Lock()
-		var connAdd int32
-		if unread > 0 {
-			// Return connection-level flow control.
-			connAdd = cc.inflow.add(unread)
-		}
 		cc.wmu.Lock()
-		if !serverSentStreamEnd {
-			cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
-			cs.didReset = true
-		}
-		if connAdd > 0 {
-			cc.fr.WriteWindowUpdate(0, uint32(connAdd))
-		}
+		cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
+		cs.didReset = true
 		cc.bw.Flush()
 		cc.wmu.Unlock()
 		cc.mu.Unlock()
@@ -2597,7 +2579,11 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 			refund += len(data)
 		}
 
-		sendConn := cc.inflow.add(refund)
+		connRefund := refund
+		if len(data) > 0 && !didReset {
+			connRefund += len(data)
+		}
+		sendConn := cc.inflow.add(connRefund)
 		var sendStream int32
 		if !didReset {
 			sendStream = cs.inflow.add(refund)
