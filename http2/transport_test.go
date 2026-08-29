@@ -2755,6 +2755,9 @@ func testTransportUsesGoAwayDebugError(t *testing.T, failMidBody bool) {
 
 func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 	ct := newClientTester(t)
+	// Use a small connection window so the 5000-byte refund crosses the
+	// announce threshold (half the window) and shows up on the wire.
+	ct.tr.ConnectionFlow = 8000
 
 	clientClosed := make(chan struct{})
 	serverWroteFirstByte := make(chan struct{})
@@ -2852,6 +2855,21 @@ func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 				}
 			}
 		}
+		if gotWindowUpdate != 5000 {
+			return fmt.Errorf("connection-level WINDOW_UPDATE credit = %d, want exactly 5000", gotWindowUpdate)
+		}
+		// The client must not refund the same bytes twice: drain until the
+		// read deadline and fail on any further connection-level credit.
+		ct.sc.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		for {
+			f, err := ct.fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			if wu, ok := f.(*WindowUpdateFrame); ok && wu.StreamID == 0 {
+				return fmt.Errorf("unexpected extra connection-level WINDOW_UPDATE: %v", summarizeFrame(f))
+			}
+		}
 		return nil
 	}
 	ct.run()
@@ -2944,6 +2962,9 @@ func TestTransportAdjustsFlowControl(t *testing.T) {
 // See golang.org/issue/16556
 func TestTransportReturnsDataPaddingFlowControl(t *testing.T) {
 	ct := newClientTester(t)
+	// Use a connection window small enough that the 6-byte padding refund
+	// crosses the announce threshold (half the window) immediately.
+	ct.tr.ConnectionFlow = 12
 
 	unblockClient := make(chan bool, 1)
 

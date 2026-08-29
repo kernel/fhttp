@@ -324,6 +324,7 @@ type ClientConn struct {
 	idleTimer   *time.Timer
 
 	inflow            inflow // peer's conn-level flow control
+	unsentConnRefund  int32  // conn-level credit not yet announced with a WINDOW_UPDATE; guarded by mu
 	initialWindowSize uint32
 
 	lastActive           time.Time
@@ -2466,6 +2467,29 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 
 var errClosedResponseBody = errors.New("http2: response body closed")
 
+// refundConnFlow returns n bytes of connection-level flow control credit.
+// Every byte taken from the connection window is refunded exactly once:
+// padding and data for reset or unknown streams are refunded as the frame is
+// processed, and response data is refunded once buffered in the stream's
+// pipe. Refunds accumulate in cc.unsentConnRefund and are only announced to
+// the peer once they reach half the connection window, matching the
+// refresh-below-half cadence browsers use; cc.inflow tracks the window as
+// announced. It returns the increment to send in a stream-0 WINDOW_UPDATE,
+// or 0 if the refund was buffered.
+//
+// cc.mu must be held.
+func (cc *ClientConn) refundConnFlow(n int32) int32 {
+	cc.unsentConnRefund += n
+	if cc.unsentConnRefund < int32(cc.connFlow/2) {
+		return 0
+	}
+	send := cc.unsentConnRefund
+	cc.unsentConnRefund = 0
+	cc.inflow.add(send)
+
+	return send
+}
+
 func (b transportResponseBody) Close() error {
 	cs := b.cs
 	cc := cs.cc
@@ -2512,7 +2536,7 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		if f.Length > 0 {
 			cc.mu.Lock()
 			ok := cc.inflow.take(f.Length)
-			connAdd := cc.inflow.add(int(f.Length))
+			connAdd := cc.refundConnFlow(int32(f.Length))
 			cc.mu.Unlock()
 			if !ok {
 				return ConnectionError(ErrCodeFlowControl)
@@ -2578,22 +2602,21 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		if didReset {
 			refund += len(data)
 		}
-
 		connRefund := refund
 		if len(data) > 0 && !didReset {
 			connRefund += len(data)
 		}
-		sendConn := cc.inflow.add(connRefund)
+		connAdd := cc.refundConnFlow(int32(connRefund))
 		var sendStream int32
 		if !didReset {
 			sendStream = cs.inflow.add(refund)
 		}
 		cc.mu.Unlock()
 
-		if sendConn > 0 || sendStream > 0 {
+		if connAdd > 0 || sendStream > 0 {
 			cc.wmu.Lock()
-			if sendConn > 0 {
-				cc.fr.WriteWindowUpdate(0, uint32(sendConn))
+			if connAdd > 0 {
+				cc.fr.WriteWindowUpdate(0, uint32(connAdd))
 			}
 			if sendStream > 0 {
 				cc.fr.WriteWindowUpdate(cs.ID, uint32(sendStream))
