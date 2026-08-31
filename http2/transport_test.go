@@ -4193,6 +4193,65 @@ func TestTransportResponseBodyCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestTransportResponseBodyCloseAfterRequestCancellation(t *testing.T) {
+	ct := newClientTester(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ct.client = func() error {
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://dummy.tld/", nil)
+		if err != nil {
+			return err
+		}
+		res, err := ct.tr.RoundTrip(req)
+		if err != nil {
+			return err
+		}
+		cancel()
+		if _, err := res.Body.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("body read error = %v; want context.Canceled", err)
+		}
+		return res.Body.Close()
+	}
+	ct.server = func() error {
+		ct.greet()
+		hf, err := ct.firstHeaders()
+		if err != nil {
+			return err
+		}
+
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		if err := ct.fr.WriteHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			BlockFragment: buf.Bytes(),
+		}); err != nil {
+			return err
+		}
+
+		for {
+			f, err := ct.readNonSettingsFrame()
+			if err != nil {
+				return fmt.Errorf("waiting for RST_STREAM: %v", err)
+			}
+			if _, ok := f.(*WindowUpdateFrame); ok {
+				continue
+			}
+			rst, ok := f.(*RSTStreamFrame)
+			if !ok {
+				return fmt.Errorf("got %T while waiting for RST_STREAM", f)
+			}
+			if rst.StreamID != hf.StreamID || rst.ErrCode != ErrCodeCancel {
+				return fmt.Errorf("got %v; want RST_STREAM CANCEL for stream %d", summarizeFrame(f), hf.StreamID)
+			}
+			return nil
+		}
+	}
+	ct.run()
+}
+
 // Issue 18891: make sure Request.Body == NoBody means no DATA frame
 // is ever sent, even if empty.
 func TestTransportNoBodyMeansNoDATA(t *testing.T) {
