@@ -2517,16 +2517,22 @@ func (b transportResponseBody) Close() error {
 	cs := b.cs
 	cc := cs.cc
 
-	serverSentStreamEnd := cs.bufPipe.Err() == io.EOF
+	pipeErr := cs.bufPipe.Err()
+	if pipeErr == errClosedResponseBody {
+		return nil
+	}
+	serverSentStreamEnd := pipeErr == io.EOF
 	cs.bufPipe.BreakWithError(errClosedResponseBody)
 
 	if !serverSentStreamEnd {
 		cc.mu.Lock()
-		cc.wmu.Lock()
-		cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
-		cs.didReset = true
-		cc.bw.Flush()
-		cc.wmu.Unlock()
+		if !cs.didReset {
+			cc.wmu.Lock()
+			cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
+			cs.didReset = true
+			cc.bw.Flush()
+			cc.wmu.Unlock()
+		}
 		cc.mu.Unlock()
 	}
 

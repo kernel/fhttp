@@ -4105,6 +4105,94 @@ func TestTransportAllocationsAfterResponseBodyClose(t *testing.T) {
 	}
 }
 
+func TestTransportResponseBodyCloseIsIdempotent(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		endStream bool
+	}{
+		{name: "unfinished"},
+		{name: "after EOF", endStream: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ct := newClientTester(t)
+			ct.client = func() error {
+				req, err := http.NewRequest("GET", "https://dummy.tld/", nil)
+				if err != nil {
+					return err
+				}
+				res, err := ct.tr.RoundTrip(req)
+				if err != nil {
+					return err
+				}
+				if test.endStream {
+					if _, err := io.ReadAll(res.Body); err != nil {
+						return err
+					}
+				}
+				if err := res.Body.Close(); err != nil {
+					return err
+				}
+				return res.Body.Close()
+			}
+			ct.server = func() error {
+				ct.greet()
+				hf, err := ct.firstHeaders()
+				if err != nil {
+					return err
+				}
+
+				var buf bytes.Buffer
+				enc := hpack.NewEncoder(&buf)
+				enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				if err := ct.fr.WriteHeaders(HeadersFrameParam{
+					StreamID:      hf.StreamID,
+					EndHeaders:    true,
+					BlockFragment: buf.Bytes(),
+				}); err != nil {
+					return err
+				}
+				if test.endStream {
+					if err := ct.fr.WriteData(hf.StreamID, true, []byte("body")); err != nil {
+						return err
+					}
+				}
+
+				ct.sc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				for {
+					f, err := ct.fr.ReadFrame()
+					if err != nil {
+						if test.endStream {
+							return nil
+						}
+						return fmt.Errorf("waiting for RST_STREAM: %v", err)
+					}
+					switch f := f.(type) {
+					case *SettingsFrame, *WindowUpdateFrame:
+						continue
+					case *RSTStreamFrame:
+						if test.endStream {
+							return fmt.Errorf("unexpected RST_STREAM after EOF: %v", summarizeFrame(f))
+						}
+						ct.sc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+						for {
+							f, err := ct.fr.ReadFrame()
+							if err != nil {
+								return nil
+							}
+							if _, ok := f.(*RSTStreamFrame); ok {
+								return fmt.Errorf("received duplicate RST_STREAM")
+							}
+						}
+					default:
+						return fmt.Errorf("got %T while waiting for RST_STREAM", f)
+					}
+				}
+			}
+			ct.run()
+		})
+	}
+}
+
 // Issue 18891: make sure Request.Body == NoBody means no DATA frame
 // is ever sent, even if empty.
 func TestTransportNoBodyMeansNoDATA(t *testing.T) {
