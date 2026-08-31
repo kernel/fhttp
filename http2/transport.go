@@ -293,6 +293,21 @@ func (t *Transport) connPool() ClientConnPool {
 	return t.connPoolOrDef
 }
 
+// BufferedUnreadBytes returns the number of response DATA bytes buffered by
+// this transport's pooled connections but not yet consumed by Response.Body
+// reads. It reports 0 when a custom ConnPool is configured, since the
+// transport cannot enumerate connections it does not own.
+func (t *Transport) BufferedUnreadBytes() int64 {
+	switch p := t.connPool().(type) {
+	case *clientConnPool:
+		return p.bufferedUnreadBytes()
+	case noDialClientConnPool:
+		return p.bufferedUnreadBytes()
+	}
+
+	return 0
+}
+
 func (t *Transport) initConnPool() {
 	if t.ConnPool != nil {
 		t.connPoolOrDef = t.ConnPool
