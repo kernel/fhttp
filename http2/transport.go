@@ -379,7 +379,8 @@ type clientStream struct {
 	bufPipe     pipe  // buffered pipe with the flow-controlled response payload
 	bytesRemain int64 // -1 means unknown; owned by transportResponseBody.Read
 	cc          *ClientConn
-	didReset    bool // whether we sent a RST_STREAM to the server; guarded by cc.mu
+	didReset    bool // whether the stream was canceled; guarded by cc.mu
+	resetSent   bool // whether a RST_STREAM was written for this stream; guarded by cc.mu
 
 	done chan struct{} // closed when stream remove from cc.streams map; close calls guarded by cc.mu
 
@@ -458,9 +459,13 @@ func (cs *clientStream) cancelStream() {
 	cc.mu.Lock()
 	didReset := cs.didReset
 	cs.didReset = true
+	writeReset := didReset && !cs.resetSent
+	if writeReset {
+		cs.resetSent = true
+	}
 	cc.mu.Unlock()
 
-	if didReset {
+	if writeReset {
 		cc.writeStreamReset(cs.ID, ErrCodeCancel, nil)
 		cc.forgetStreamID(cs.ID)
 	}
@@ -2526,9 +2531,10 @@ func (b transportResponseBody) Close() error {
 
 	if !serverSentStreamEnd {
 		cc.mu.Lock()
-		if !cs.didReset {
+		if !cs.resetSent {
 			cc.wmu.Lock()
 			cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
+			cs.resetSent = true
 			cs.didReset = true
 			cc.bw.Flush()
 			cc.wmu.Unlock()
