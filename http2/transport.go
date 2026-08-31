@@ -297,6 +297,21 @@ func (t *Transport) connPool() ClientConnPool {
 	return t.connPoolOrDef
 }
 
+// BufferedUnreadBytes returns the number of response DATA bytes buffered by
+// this transport's pooled connections but not yet consumed by Response.Body
+// reads. It reports 0 when a custom ConnPool is configured, since the
+// transport cannot enumerate connections it does not own.
+func (t *Transport) BufferedUnreadBytes() int64 {
+	switch p := t.connPool().(type) {
+	case *clientConnPool:
+		return p.bufferedUnreadBytes()
+	case noDialClientConnPool:
+		return p.bufferedUnreadBytes()
+	}
+
+	return 0
+}
+
 func (t *Transport) initConnPool() {
 	if t.ConnPool != nil {
 		t.connPoolOrDef = t.ConnPool
@@ -937,6 +952,24 @@ func (cc *ClientConn) CanTakeNewRequest() bool {
 	defer cc.mu.Unlock()
 
 	return cc.canTakeNewRequestLocked()
+}
+
+// BufferedUnreadBytes returns the number of response DATA bytes buffered by
+// this connection's streams but not yet consumed by Response.Body reads.
+// Connection-level flow control is refunded once DATA is buffered, so this
+// memory is bounded per stream by its window but no longer bounded per
+// connection; callers can export the sum as a gauge to watch for unread
+// bodies accumulating.
+func (cc *ClientConn) BufferedUnreadBytes() int64 {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	var n int64
+	for _, cs := range cc.streams {
+		n += int64(cs.bufPipe.Len())
+	}
+
+	return n
 }
 
 // clientConnIdleState describes the suitability of a client

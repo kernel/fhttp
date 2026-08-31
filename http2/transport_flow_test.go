@@ -130,6 +130,10 @@ func TestTransportPausedBodiesDoNotExhaustConnectionWindow(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	if got, want := cc.BufferedUnreadBytes(), int64(3*streamWindow); got != want {
+		t.Fatalf("BufferedUnreadBytes = %d, want %d", got, want)
+	}
+
 	req, err := http.NewRequest(http.MethodGet, "https://example.test/fourth", nil)
 	if err != nil {
 		t.Fatal(err)

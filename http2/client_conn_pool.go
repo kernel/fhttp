@@ -270,6 +270,25 @@ func filterOutClientConn(in []*ClientConn, exclude *ClientConn) []*ClientConn {
 	return out
 }
 
+// bufferedUnreadBytes returns the sum of BufferedUnreadBytes over all pooled
+// connections. Connection references are collected under the pool lock and
+// summed outside it, since BufferedUnreadBytes takes each conn's own mutex.
+func (p *clientConnPool) bufferedUnreadBytes() int64 {
+	p.mu.Lock()
+	var conns []*ClientConn
+	for _, vv := range p.conns {
+		conns = append(conns, vv...)
+	}
+	p.mu.Unlock()
+
+	var n int64
+	for _, cc := range conns {
+		n += cc.BufferedUnreadBytes()
+	}
+
+	return n
+}
+
 // noDialClientConnPool is an implementation of http2.ClientConnPool
 // which never dials. We let the HTTP/1.1 client dial and use its TLS
 // connection instead.
