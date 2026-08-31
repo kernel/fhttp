@@ -293,6 +293,21 @@ func (t *Transport) connPool() ClientConnPool {
 	return t.connPoolOrDef
 }
 
+// BufferedUnreadBytes returns the number of response DATA bytes buffered by
+// this transport's pooled connections but not yet consumed by Response.Body
+// reads. It reports 0 when a custom ConnPool is configured, since the
+// transport cannot enumerate connections it does not own.
+func (t *Transport) BufferedUnreadBytes() int64 {
+	switch p := t.connPool().(type) {
+	case *clientConnPool:
+		return p.bufferedUnreadBytes()
+	case noDialClientConnPool:
+		return p.bufferedUnreadBytes()
+	}
+
+	return 0
+}
+
 func (t *Transport) initConnPool() {
 	if t.ConnPool != nil {
 		t.connPoolOrDef = t.ConnPool
@@ -933,6 +948,24 @@ func (cc *ClientConn) CanTakeNewRequest() bool {
 	defer cc.mu.Unlock()
 
 	return cc.canTakeNewRequestLocked()
+}
+
+// BufferedUnreadBytes returns the number of response DATA bytes buffered by
+// this connection's streams but not yet consumed by Response.Body reads.
+// Connection-level flow control is refunded once DATA is buffered, so this
+// memory is bounded per stream by its window but no longer bounded per
+// connection; callers can export the sum as a gauge to watch for unread
+// bodies accumulating.
+func (cc *ClientConn) BufferedUnreadBytes() int64 {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	var n int64
+	for _, cs := range cc.streams {
+		n += int64(cs.bufPipe.Len())
+	}
+
+	return n
 }
 
 // clientConnIdleState describes the suitability of a client
@@ -2437,28 +2470,18 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	// Credit every byte the application consumes back to the flow control
-	// windows. The inflow accounting batches wire updates (at least
-	// inflowMinRefresh bytes, or enough to at least double the peer's
-	// remaining window), and unlike a threshold refresh it conserves
-	// credit exactly: bytes read from a body that is closed shortly after
-	// are still refunded by the next stream's reads instead of stranding
-	// until the connection window strangles to zero.
-	connAdd := cc.inflow.add(n)
+	// Credit bytes consumed by the application back to the stream-level
+	// flow-control window. Connection-level credit is refunded when DATA is
+	// buffered, so it must not be refunded again here.
 	var streamAdd int32
 	if err == nil { // No need to refresh if the stream is over or failed.
 		streamAdd = cs.inflow.add(n)
 	}
 
-	if connAdd != 0 || streamAdd != 0 {
+	if streamAdd != 0 {
 		cc.wmu.Lock()
 		defer cc.wmu.Unlock()
-		if connAdd != 0 {
-			cc.fr.WriteWindowUpdate(0, mustUint31(connAdd))
-		}
-		if streamAdd != 0 {
-			cc.fr.WriteWindowUpdate(cs.ID, mustUint31(streamAdd))
-		}
+		cc.fr.WriteWindowUpdate(cs.ID, mustUint31(streamAdd))
 		cc.bw.Flush()
 	}
 
@@ -2485,7 +2508,7 @@ func (cc *ClientConn) refundConnFlow(n int32) int32 {
 	}
 	send := cc.unsentConnRefund
 	cc.unsentConnRefund = 0
-	cc.inflow.add(send)
+	cc.inflow.add(int(send))
 
 	return send
 }

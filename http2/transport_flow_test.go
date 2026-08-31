@@ -361,7 +361,7 @@ func TestTransportPausedBodiesDoNotExhaustConnectionWindow(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		cc.mu.Lock()
-		available := cc.inflow.available()
+		available := cc.inflow.avail
 		pending := cc.unsentConnRefund
 		streams := make([]*clientStream, 0, len(cc.streams))
 		for _, cs := range cc.streams {
