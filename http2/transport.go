@@ -2518,6 +2518,7 @@ func (b transportResponseBody) Close() error {
 	cc := cs.cc
 
 	serverSentStreamEnd := cs.bufPipe.Err() == io.EOF
+	cs.bufPipe.BreakWithError(errClosedResponseBody)
 
 	if !serverSentStreamEnd {
 		cc.mu.Lock()
