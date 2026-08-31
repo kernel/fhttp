@@ -29,10 +29,10 @@ import (
 
 	tls "github.com/bogdanfinn/utls"
 
-	http "github.com/bogdanfinn/fhttp"
-	"github.com/bogdanfinn/fhttp/httptrace"
+	http "github.com/kernel/fhttp"
+	"github.com/kernel/fhttp/httptrace"
 
-	"github.com/bogdanfinn/fhttp/http2/hpack"
+	"github.com/kernel/fhttp/http2/hpack"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
 )
@@ -47,10 +47,6 @@ const (
 	// control tokens we announce to the peer, and how many bytes
 	// we buffer per stream.
 	transportDefaultStreamFlow = 4 << 20
-
-	// transportDefaultStreamMinRefresh is the minimum number of bytes we'll send
-	// a stream-level WINDOW_UPDATE for at a time.
-	transportDefaultStreamMinRefresh = 4 << 10
 )
 
 // Transport is an HTTP/2 Transport.
@@ -327,7 +323,7 @@ type ClientConn struct {
 	idleTimeout time.Duration // or 0 for never
 	idleTimer   *time.Timer
 
-	inflow            flow // peer's conn-level flow control
+	inflow            inflow // peer's conn-level flow control
 	initialWindowSize uint32
 
 	lastActive           time.Time
@@ -377,8 +373,8 @@ type clientStream struct {
 	flow         flow // guarded by cc.mu
 	gotEndStream bool // got frame with END_STREAM flag set
 	ID           uint32
-	inflow       flow  // guarded by cc.mu
-	num1xx       uint8 // number of 1xx responses seen
+	inflow       inflow // guarded by cc.mu
+	num1xx       uint8  // number of 1xx responses seen
 
 	on100 func() // optional code to run if get a 100 continue response
 
@@ -876,7 +872,7 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 	}
 
 	// Use the dynamic connection flow value we calculated earlier
-	cc.inflow.add(int32(cc.connFlow) + int32(initialWindowSize))
+	cc.inflow.init(int32(cc.connFlow) + initialWindowSize)
 
 	cc.bw.Flush()
 	if cc.werr != nil {
@@ -1997,8 +1993,7 @@ func (cc *ClientConn) newStreamWithID(streamID uint32, incNext bool) *clientStre
 	}
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.add(int32(cc.streamFlow))
-	cs.inflow.setConnFlow(&cc.inflow)
+	cs.inflow.init(int32(cc.streamFlow))
 	cc.streams[cs.ID] = cs
 
 	if incNext {
@@ -2441,46 +2436,17 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	var connAdd, streamAdd int32
-
-	// Check the conn-level first, before the stream-level.
-	// Use dynamic connFlow logic
-	if v := cc.inflow.available(); v < int32(cc.connFlow/2) {
-		connAdd = int32(cc.connFlow) - v
-		cc.inflow.add(connAdd)
-	}
-
-	if err == nil {
-		// Consider any buffered body data (read from the conn but not
-		// consumed by the client) when computing flow control for this
-		// stream.
-
-		// Use dynamic streamFlow logic
-		unsent := int(cc.streamFlow) - int(cs.inflow.available()) + cs.bufPipe.Len()
-
-		// ------------------------------------------------------------------
-		// FIX: Adaptive Logic
-		// ------------------------------------------------------------------
-		const aggressiveThreshold = 16384 // 16KB
-
-		// Check if the configured initial window is small (e.g. Firefox's 128KB or 65KB).
-		// If so, we need to be aggressive with updates.
-		isSmallWindow := cc.initialWindowSize < 1048576 // < 1MB
-
-		if isSmallWindow {
-			if unsent > aggressiveThreshold {
-				streamAdd = int32(unsent)
-				cs.inflow.add(streamAdd)
-			}
-		} else {
-			// Fallback to standard behavior for large windows (Chrome/Default).
-			// FIX: Replaced transportDefaultStreamFlow constant with cc.streamFlow.
-			// This ensures correct behavior if a user sets a custom Large window (e.g. 6MB).
-			if unsent > transportDefaultStreamMinRefresh && unsent > int(cc.streamFlow)/2 {
-				streamAdd = int32(unsent)
-				cs.inflow.add(streamAdd)
-			}
-		}
+	// Credit every byte the application consumes back to the flow control
+	// windows. The inflow accounting batches wire updates (at least
+	// inflowMinRefresh bytes, or enough to at least double the peer's
+	// remaining window), and unlike a threshold refresh it conserves
+	// credit exactly: bytes read from a body that is closed shortly after
+	// are still refunded by the next stream's reads instead of stranding
+	// until the connection window strangles to zero.
+	connAdd := cc.inflow.add(n)
+	var streamAdd int32
+	if err == nil { // No need to refresh if the stream is over or failed.
+		streamAdd = cs.inflow.add(n)
 	}
 
 	if connAdd != 0 || streamAdd != 0 {
@@ -2505,26 +2471,35 @@ func (b transportResponseBody) Close() error {
 	cc := cs.cc
 
 	serverSentStreamEnd := cs.bufPipe.Err() == io.EOF
+
+	// Break the pipe before returning flow control credit for unread data.
+	// Pipe writes fail from here on, so no data can land in the pipe (and
+	// silently lose its connection-level credit) between the refund below and
+	// the break. See golang.org/x/net commit 9f24bb44.
+	cs.bufPipe.BreakWithError(errClosedResponseBody)
+
 	unread := cs.bufPipe.Len()
 
 	if unread > 0 || !serverSentStreamEnd {
 		cc.mu.Lock()
+		var connAdd int32
+		if unread > 0 {
+			// Return connection-level flow control.
+			connAdd = cc.inflow.add(unread)
+		}
 		cc.wmu.Lock()
 		if !serverSentStreamEnd {
 			cc.fr.WriteRSTStream(cs.ID, ErrCodeCancel)
 			cs.didReset = true
 		}
-		// Return connection-level flow control.
-		if unread > 0 {
-			cc.inflow.add(int32(unread))
-			cc.fr.WriteWindowUpdate(0, uint32(unread))
+		if connAdd > 0 {
+			cc.fr.WriteWindowUpdate(0, uint32(connAdd))
 		}
 		cc.bw.Flush()
 		cc.wmu.Unlock()
 		cc.mu.Unlock()
 	}
 
-	cs.bufPipe.BreakWithError(errClosedResponseBody)
 	cc.forgetStreamID(cs.ID)
 
 	return nil
@@ -2554,13 +2529,18 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		// But at least return their flow control:
 		if f.Length > 0 {
 			cc.mu.Lock()
-			cc.inflow.add(int32(f.Length))
+			ok := cc.inflow.take(f.Length)
+			connAdd := cc.inflow.add(int(f.Length))
 			cc.mu.Unlock()
-
-			cc.wmu.Lock()
-			cc.fr.WriteWindowUpdate(0, uint32(f.Length))
-			cc.bw.Flush()
-			cc.wmu.Unlock()
+			if !ok {
+				return ConnectionError(ErrCodeFlowControl)
+			}
+			if connAdd > 0 {
+				cc.wmu.Lock()
+				cc.fr.WriteWindowUpdate(0, uint32(connAdd))
+				cc.bw.Flush()
+				cc.wmu.Unlock()
+			}
 		}
 
 		return nil
@@ -2589,9 +2569,7 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		}
 		// Check connection-level flow control.
 		cc.mu.Lock()
-		if cs.inflow.available() >= int32(f.Length) {
-			cs.inflow.take(int32(f.Length))
-		} else {
+		if !takeInflows(&cc.inflow, &cs.inflow, f.Length) {
 			cc.mu.Unlock()
 
 			return ConnectionError(ErrCodeFlowControl)
@@ -2602,31 +2580,40 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		if pad := int(f.Length) - len(data); pad > 0 {
 			refund += pad
 		}
+
+		didReset := cs.didReset
+		if len(data) > 0 && !didReset {
+			if _, err := cs.bufPipe.Write(data); err != nil {
+				// The response body has been closed; writes to its pipe
+				// fail, so the data will never be read. Fall through to
+				// refund its connection-level flow control below rather
+				// than silently losing the credit.
+				didReset = true
+			}
+		}
 		// Return len(data) now if the stream is already closed,
 		// since data will never be read.
-		didReset := cs.didReset
 		if didReset {
 			refund += len(data)
 		}
-		if refund > 0 {
-			cc.inflow.add(int32(refund))
-			cc.wmu.Lock()
-			cc.fr.WriteWindowUpdate(0, uint32(refund))
-			if !didReset {
-				cs.inflow.add(int32(refund))
-				cc.fr.WriteWindowUpdate(cs.ID, uint32(refund))
-			}
-			cc.bw.Flush()
-			cc.wmu.Unlock()
+
+		sendConn := cc.inflow.add(refund)
+		var sendStream int32
+		if !didReset {
+			sendStream = cs.inflow.add(refund)
 		}
 		cc.mu.Unlock()
 
-		if len(data) > 0 && !didReset {
-			if _, err := cs.bufPipe.Write(data); err != nil {
-				rl.endStreamError(cs, err)
-
-				return err
+		if sendConn > 0 || sendStream > 0 {
+			cc.wmu.Lock()
+			if sendConn > 0 {
+				cc.fr.WriteWindowUpdate(0, uint32(sendConn))
 			}
+			if sendStream > 0 {
+				cc.fr.WriteWindowUpdate(cs.ID, uint32(sendStream))
+			}
+			cc.bw.Flush()
+			cc.wmu.Unlock()
 		}
 	}
 

@@ -9,8 +9,8 @@ import (
 	"reflect"
 	"testing"
 
-	http "github.com/bogdanfinn/fhttp"
-	"github.com/bogdanfinn/fhttp/http2/hpack"
+	http "github.com/kernel/fhttp"
+	"github.com/kernel/fhttp/http2/hpack"
 )
 
 func TestPushPromiseHeadersToHTTPRequest(t *testing.T) {
