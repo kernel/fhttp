@@ -4176,6 +4176,88 @@ func TestTransportResponseBodyCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestTransportRequestCancelSendsOneReset(t *testing.T) {
+	ct := newClientTester(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resetReceived := make(chan struct{})
+	bodyClosed := make(chan struct{})
+
+	ct.client = func() error {
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://dummy.tld/", nil)
+		if err != nil {
+			return err
+		}
+		res, err := ct.tr.RoundTrip(req)
+		if err != nil {
+			return err
+		}
+		defer close(bodyClosed)
+
+		cancel()
+		select {
+		case <-resetReceived:
+		case <-time.After(time.Second):
+			return errors.New("timed out waiting for RST_STREAM after request cancellation")
+		}
+		if _, err := res.Body.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("body read error = %v; want context.Canceled", err)
+		}
+		return res.Body.Close()
+	}
+	ct.server = func() error {
+		ct.greet()
+		hf, err := ct.firstHeaders()
+		if err != nil {
+			return err
+		}
+
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		if err := ct.fr.WriteHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			BlockFragment: buf.Bytes(),
+		}); err != nil {
+			return err
+		}
+
+		ct.sc.SetReadDeadline(time.Now().Add(time.Second))
+		for {
+			f, err := ct.readNonSettingsFrame()
+			if err != nil {
+				return fmt.Errorf("waiting for RST_STREAM after request cancellation: %v", err)
+			}
+			if _, ok := f.(*WindowUpdateFrame); ok {
+				continue
+			}
+			rst, ok := f.(*RSTStreamFrame)
+			if !ok || rst.StreamID != hf.StreamID || rst.ErrCode != ErrCodeCancel {
+				return fmt.Errorf("got %v; want RST_STREAM CANCEL for stream %d", summarizeFrame(f), hf.StreamID)
+			}
+			break
+		}
+		close(resetReceived)
+		<-bodyClosed
+
+		ct.sc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		for {
+			f, err := ct.fr.ReadFrame()
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					return nil
+				}
+				return fmt.Errorf("reading frames after response body close: %v", err)
+			}
+			if rst, ok := f.(*RSTStreamFrame); ok && rst.StreamID == hf.StreamID {
+				return fmt.Errorf("received duplicate RST_STREAM after response body close: %v", summarizeFrame(f))
+			}
+		}
+	}
+	ct.run()
+}
+
 // Issue 18891: make sure Request.Body == NoBody means no DATA frame
 // is ever sent, even if empty.
 func TestTransportNoBodyMeansNoDATA(t *testing.T) {
