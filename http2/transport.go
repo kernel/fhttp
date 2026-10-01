@@ -77,6 +77,12 @@ type Transport struct {
 	// it will be used to set http.Response.TLS.
 	DialTLS func(network, addr string, cfg *tls.Config) (net.Conn, error)
 
+	// DialTLSContext takes precedence over DialTLS when set. Shared pool dials
+	// retain the initiating request's context values, but not its cancellation
+	// or deadline; the callback must bound its own connection setup. Single-use
+	// dials receive the request context unchanged.
+	DialTLSContext func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error)
+
 	// DisableCompression, if true, prevents the Transport from
 	// requesting compression with an "Accept-Encoding: gzip"
 	// request header when the Request contains no existing
@@ -693,12 +699,17 @@ func canRetryError(err error) bool {
 	return false
 }
 
-func (t *Transport) dialClientConn(addr string, singleUse bool) (*ClientConn, error) {
+func (t *Transport) dialClientConn(ctx context.Context, addr string, singleUse bool) (*ClientConn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	tconn, err := t.dialTLS()("tcp", addr, t.newTLSConfig(host))
+	var tconn net.Conn
+	if t.DialTLSContext != nil {
+		tconn, err = t.DialTLSContext(ctx, "tcp", addr, t.newTLSConfig(host))
+	} else {
+		tconn, err = t.dialTLS()("tcp", addr, t.newTLSConfig(host))
+	}
 	if err != nil {
 		return nil, err
 	}
