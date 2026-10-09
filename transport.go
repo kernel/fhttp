@@ -869,6 +869,11 @@ var (
 	errServerClosedIdle = errors.New("http: server closed idle connection")
 )
 
+// ErrServerClosedIdle is returned when the server closes a reused connection
+// before any response byte arrives. A caller that resends requests itself can
+// match it with errors.Is instead of comparing error strings.
+var ErrServerClosedIdle = errServerClosedIdle
+
 // transportReadFromServerError is used by Transport.readLoop when the
 // 1 byte peek read fails and we're actually anticipating a response.
 // Usually this is just due to the inherent keep-alive shut down race,
@@ -2038,7 +2043,7 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritte
 		if pc.nwrite == startBytesWritten {
 			return nothingWrittenError{err}
 		}
-		return fmt.Errorf("net/http: HTTP/1.x transport connection broken: %v", err)
+		return fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w", err)
 	}
 	return err
 }
