@@ -281,3 +281,17 @@ func TestGzipReader_DoubleReadCrash(t *testing.T) {
 		t.Fatalf("second Read = %v, %v; want 0, %v", n, err2, err1)
 	}
 }
+
+// A connection that breaks after the request was written keeps its cause
+// reachable through errors.Is, as in net/http.
+func TestMapRoundTripErrorWrapsBrokenConnectionCause(t *testing.T) {
+	pc := &persistConn{writeLoopDone: make(chan struct{}), closed: io.ErrUnexpectedEOF, nwrite: 1}
+	close(pc.writeLoopDone)
+	err := pc.mapRoundTripError(&transportRequest{Request: &Request{}}, 0, io.ErrUnexpectedEOF)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("mapRoundTripError = %v; want it to wrap io.ErrUnexpectedEOF", err)
+	}
+	if want := "net/http: HTTP/1.x transport connection broken: unexpected EOF"; err.Error() != want {
+		t.Fatalf("error = %q; want %q", err, want)
+	}
+}

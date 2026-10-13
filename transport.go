@@ -2038,7 +2038,7 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritte
 		if pc.nwrite == startBytesWritten {
 			return nothingWrittenError{err}
 		}
-		return fmt.Errorf("net/http: HTTP/1.x transport connection broken: %v", err)
+		return fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w", err)
 	}
 	return err
 }
