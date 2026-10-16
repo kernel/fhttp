@@ -75,9 +75,11 @@ func TestTransportPriorityDependencies(t *testing.T) {
 		path string
 		dep  uint32
 	}
-	// Streams 1 (/u0) and 5 (/u1) finish before the last two requests, so
-	// those depend only on streams 3 and 7.
-	steps := []step{{"/u0", 0}, {"/u2", 1}, {"/u1", 1}, {"/u2b", 5}, {"/u3", 7}, {"/u0b", 0}}
+	// A stream depends on the newest open stream of its own weight, else of
+	// the lowest higher weight: /u2b skips the newer /u1 (stream 5) for /u2
+	// (stream 3). Streams 1 (/u0) and 5 (/u1) finish before the last two
+	// requests, so /u3 falls back to stream 7 and /u0b to stream 0.
+	steps := []step{{"/u0", 0}, {"/u2", 1}, {"/u1", 1}, {"/u2b", 3}, {"/u3", 7}, {"/u0b", 0}}
 	const finishAfter = 4
 
 	ct := newClientTester(t)

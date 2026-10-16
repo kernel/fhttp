@@ -102,10 +102,11 @@ type Transport struct {
 	HeaderPriorityFunc func(req *http.Request) *PriorityParam
 
 	// PriorityDependencies, if true, makes each new stream depend
-	// exclusively on the most recently opened stream on its connection that
-	// is still open and has an equal or higher weight, or on stream 0 if
-	// there is none, overriding the StreamDep and Exclusive of its HEADERS
-	// priority. This is how Chrome builds its HTTP/2 priority tree.
+	// exclusively on an open stream on its connection, overriding the
+	// StreamDep and Exclusive of its HEADERS priority: the most recently
+	// opened stream with the same weight, or failing that with the lowest
+	// higher weight, or stream 0 if there is none. This is how Chrome builds
+	// its HTTP/2 priority tree (Http2PriorityDependencies).
 	PriorityDependencies bool
 
 	// IdleConnTimeout is the maximum amount of time an idle (keep-alive)
@@ -236,10 +237,10 @@ func (cc *ClientConn) streamPriority(cs *clientStream) PriorityParam {
 		return p
 	}
 	p.StreamDep, p.Exclusive = 0, true
-	for i := len(cc.openPriorities) - 1; i >= 0; i-- {
-		if cc.openPriorities[i].weight >= p.Weight {
-			p.StreamDep = cc.openPriorities[i].id
-			break
+	var parentWeight uint8
+	for _, sp := range cc.openPriorities {
+		if sp.weight >= p.Weight && (p.StreamDep == 0 || sp.weight <= parentWeight) {
+			p.StreamDep, parentWeight = sp.id, sp.weight
 		}
 	}
 	cc.openPriorities = append(cc.openPriorities, streamPriority{id: cs.ID, weight: p.Weight})
