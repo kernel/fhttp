@@ -152,6 +152,10 @@ type Transport struct {
 	// The callback may be called concurrently for different connections.
 	OnHealthCheckFailure func(conn net.Conn, err error)
 
+	// OnHealthCheckFailureDetails is like OnHealthCheckFailure, but includes
+	// phase timings and stream counts. If both callbacks are set, both run.
+	OnHealthCheckFailureDetails func(conn net.Conn, err error, details HealthCheckFailureDetails)
+
 	// Settings should not include InitialWindowSize or HeaderTableSize, set that in Transport
 	Settings      map[SettingID]uint32
 	SettingsOrder []SettingID
@@ -990,17 +994,29 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 }
 
 func (cc *ClientConn) healthCheck() {
+	started := time.Now()
 	pingTimeout := cc.t.pingTimeout()
 	// We don't need to periodically ping in the health check, because the readLoop of ClientConn will
 	// trigger the healthCheck again if there is no frame received.
 	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
 	defer cancel()
-	err := cc.Ping(ctx)
+	cc.mu.Lock()
+	activeStreams := len(cc.streams)
+	cc.mu.Unlock()
+	details, err := cc.ping(ctx)
 	if err != nil {
+		details.ActiveStreamsAtStart = activeStreams
+		cc.mu.Lock()
+		details.ActiveStreamsAtFailure = len(cc.streams)
+		cc.mu.Unlock()
+		details.TotalDuration = time.Since(started)
 		cc.closeForLostPing()
 		cc.t.connPool().MarkDead(cc)
 		if cc.t.OnHealthCheckFailure != nil {
 			cc.t.OnHealthCheckFailure(cc.tconn, err)
+		}
+		if cc.t.OnHealthCheckFailureDetails != nil {
+			cc.t.OnHealthCheckFailureDetails(cc.tconn, err, details)
 		}
 
 		return
@@ -2906,12 +2922,20 @@ func (rl *clientConnReadLoop) processResetStream(f *RSTStreamFrame) error {
 
 // Ping sends a PING frame to the server and waits for the ack.
 func (cc *ClientConn) Ping(ctx context.Context) error {
+	_, err := cc.ping(ctx)
+	return err
+}
+
+func (cc *ClientConn) ping(ctx context.Context) (details HealthCheckFailureDetails, err error) {
+	started := time.Now()
+	defer func() { details.TotalDuration = time.Since(started) }()
+	details.Phase = "prepare"
 	c := make(chan struct{})
 	// Generate a random payload
 	var p [8]byte
 	for {
 		if _, err := rand.Read(p[:]); err != nil {
-			return err
+			return details, err
 		}
 		cc.mu.Lock()
 		// check for dup before insert
@@ -2923,26 +2947,35 @@ func (cc *ClientConn) Ping(ctx context.Context) error {
 		}
 		cc.mu.Unlock()
 	}
+	details.Phase = "write_lock"
+	lockStarted := time.Now()
 	cc.wmu.Lock()
-	if err := cc.fr.WritePing(false, p); err != nil {
-		cc.wmu.Unlock()
-
-		return err
+	details.WriteLockWait = time.Since(lockStarted)
+	writeStarted := time.Now()
+	details.Phase = "write_frame"
+	err = cc.fr.WritePing(false, p)
+	if err == nil {
+		details.Phase = "flush"
+		err = cc.bw.Flush()
 	}
-	if err := cc.bw.Flush(); err != nil {
-		cc.wmu.Unlock()
-
-		return err
-	}
+	details.WriteDuration = time.Since(writeStarted)
 	cc.wmu.Unlock()
+	if err != nil {
+		return details, err
+	}
+	details.PingWriteCompleted = true
+	details.DeadlineExpiredBeforeAckWait = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	details.Phase = "ack_wait"
+	ackStarted := time.Now()
+	defer func() { details.AckWait = time.Since(ackStarted) }()
 	select {
 	case <-c:
-		return nil
+		return details, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return details, ctx.Err()
 	case <-cc.readerDone:
 		// connection closed
-		return cc.readerErr
+		return details, cc.readerErr
 	}
 }
 
