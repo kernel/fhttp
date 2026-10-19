@@ -3381,6 +3381,13 @@ func TestTransportNoRaceOnRequestObjectAfterRequestComplete(t *testing.T) {
 func TestTransportCloseAfterLostPing(t *testing.T) {
 	clientDone := make(chan struct{})
 	ct := newClientTester(t)
+	pingFailure := make(chan error, 1)
+	ct.tr.OnHealthCheckFailure = func(conn net.Conn, err error) {
+		if conn != ct.cc {
+			t.Errorf("health check connection = %v, want %v", conn, ct.cc)
+		}
+		pingFailure <- err
+	}
 	ct.tr.PingTimeout = 1 * time.Second
 	ct.tr.ReadIdleTimeout = 1 * time.Second
 	ct.client = func() error {
@@ -3391,6 +3398,14 @@ func TestTransportCloseAfterLostPing(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "client connection lost") {
 			return fmt.Errorf("expected to get error about \"connection lost\", got %v", err)
 		}
+		select {
+		case err := <-pingFailure:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("health check error = %v, want deadline exceeded", err)
+			}
+		case <-time.After(5 * time.Second):
+			return errors.New("health check failure callback was not called")
+		}
 		return nil
 	}
 	ct.server = func() error {
@@ -3399,6 +3414,48 @@ func TestTransportCloseAfterLostPing(t *testing.T) {
 		return nil
 	}
 	ct.run()
+}
+
+func TestTransportHealthCheckFailureCallback(t *testing.T) {
+	for _, mode := range []string{"write", "read", "nil_callback"} {
+		t.Run(mode, func(t *testing.T) {
+			cause := errors.New(mode + " failure")
+			conn := &fakeConnErr{writeErr: cause}
+			cc := &ClientConn{
+				t:          &Transport{},
+				tconn:      conn,
+				pings:      make(map[[8]byte]chan struct{}),
+				readerDone: make(chan struct{}),
+			}
+			cc.cond = sync.NewCond(&cc.mu)
+			cc.bw = bufio.NewWriter(conn)
+			if mode == "read" {
+				cc.bw = bufio.NewWriter(ioutil.Discard)
+				cc.readerErr = cause
+				close(cc.readerDone)
+			}
+			cc.fr = NewFramer(cc.bw, nil)
+			calls := 0
+			if mode != "nil_callback" {
+				cc.t.OnHealthCheckFailure = func(gotConn net.Conn, err error) {
+					calls++
+					if gotConn != conn || err != cause {
+						t.Errorf("callback = (%v, %v), want (%v, %v)", gotConn, err, conn, cause)
+					}
+					if !conn.closed || !cc.closed {
+						t.Error("callback ran before connection closed")
+					}
+				}
+			}
+			cc.healthCheck()
+			if !conn.closed || !cc.closed {
+				t.Error("failed health check did not close connection")
+			}
+			if mode != "nil_callback" && calls != 1 {
+				t.Errorf("callback calls = %d, want 1", calls)
+			}
+		})
+	}
 }
 
 func TestTransportPingWhenReading(t *testing.T) {
@@ -3449,6 +3506,9 @@ func testTransportPingWhenReading(t *testing.T, readIdleTimeout, serverResponseI
 	ct := newClientTester(t)
 	ct.tr.PingTimeout = 10 * time.Millisecond
 	ct.tr.ReadIdleTimeout = readIdleTimeout
+	ct.tr.OnHealthCheckFailure = func(_ net.Conn, err error) {
+		t.Errorf("unexpected health check failure: %v", err)
+	}
 	// guards the ct.fr.Write
 	var wmu sync.Mutex
 

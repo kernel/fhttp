@@ -133,6 +133,12 @@ type Transport struct {
 	// If zero, no health check is performed.
 	ReadIdleTimeout time.Duration
 
+	// OnHealthCheckFailure, if non-nil, is called after a failed health-check
+	// PING closes conn and removes it from the pool. The error is the original
+	// Ping error, not the generic error returned to interrupted requests.
+	// The callback may be called concurrently for different connections.
+	OnHealthCheckFailure func(conn net.Conn, err error)
+
 	// Settings should not include InitialWindowSize or HeaderTableSize, set that in Transport
 	Settings      map[SettingID]uint32
 	SettingsOrder []SettingID
@@ -927,6 +933,9 @@ func (cc *ClientConn) healthCheck() {
 	if err != nil {
 		cc.closeForLostPing()
 		cc.t.connPool().MarkDead(cc)
+		if cc.t.OnHealthCheckFailure != nil {
+			cc.t.OnHealthCheckFailure(cc.tconn, err)
+		}
 
 		return
 	}
