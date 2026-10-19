@@ -96,6 +96,19 @@ type Transport struct {
 	HeaderPriority  *PriorityParam
 	HeaderTableSize uint32 // if nil, will use global initialHeaderTableSize
 
+	// HeaderPriorityFunc, if non-nil, returns the priority written on req's
+	// HEADERS frame, taking precedence over HeaderPriority. Returning nil
+	// falls back to HeaderPriority.
+	HeaderPriorityFunc func(req *http.Request) *PriorityParam
+
+	// PriorityDependencies, if true, makes each new stream depend
+	// exclusively on an open stream on its connection, overriding the
+	// StreamDep and Exclusive of its HEADERS priority: the most recently
+	// opened stream with the same weight, or failing that with the lowest
+	// higher weight, or stream 0 if there is none. This is how Chrome builds
+	// its HTTP/2 priority tree (Http2PriorityDependencies).
+	PriorityDependencies bool
+
 	// IdleConnTimeout is the maximum amount of time an idle (keep-alive)
 	// connection will remain idle before closing itself. Zero means no limit.
 	IdleConnTimeout time.Duration
@@ -191,6 +204,57 @@ func (t *Transport) maxHeaderListSize() uint32 {
 	}
 
 	return maxHeaderListSize
+}
+
+func (t *Transport) headerPriority(req *http.Request) PriorityParam {
+	if t.HeaderPriorityFunc != nil {
+		if p := t.HeaderPriorityFunc(req); p != nil {
+			return *p
+		}
+	}
+	if t.HeaderPriority != nil {
+		return *t.HeaderPriority
+	}
+	return PriorityParam{
+		Exclusive: true,
+		Weight:    255,
+		StreamDep: 0,
+	}
+}
+
+type streamPriority struct {
+	id     uint32
+	weight uint8
+}
+
+// streamPriority returns the priority for cs's HEADERS frame and, with
+// PriorityDependencies, records cs as an open stream.
+//
+// requires cc.mu be held.
+func (cc *ClientConn) streamPriority(cs *clientStream) PriorityParam {
+	p := cc.t.headerPriority(cs.req)
+	if !cc.t.PriorityDependencies {
+		return p
+	}
+	p.StreamDep, p.Exclusive = 0, true
+	var parentWeight uint8
+	for _, sp := range cc.openPriorities {
+		if sp.weight >= p.Weight && (p.StreamDep == 0 || sp.weight <= parentWeight) {
+			p.StreamDep, parentWeight = sp.id, sp.weight
+		}
+	}
+	cc.openPriorities = append(cc.openPriorities, streamPriority{id: cs.ID, weight: p.Weight})
+	return p
+}
+
+// requires cc.mu be held.
+func (cc *ClientConn) forgetStreamPriority(id uint32) {
+	for i, sp := range cc.openPriorities {
+		if sp.id == id {
+			cc.openPriorities = append(cc.openPriorities[:i], cc.openPriorities[i+1:]...)
+			return
+		}
+	}
 }
 
 func (t *Transport) disableCompression() bool {
@@ -368,6 +432,7 @@ type ClientConn struct {
 	singleUse bool   // whether being used for a single http.Request
 
 	streams         map[uint32]*clientStream // client-initiated
+	openPriorities  []streamPriority         // open streams in creation order, for Transport.PriorityDependencies
 	t               *Transport
 	tconn           net.Conn             // usually *tls.Conn, except specialized impls
 	tlsState        *tls.ConnectionState // nil only for specialized impls
@@ -406,6 +471,7 @@ type clientStream struct {
 
 	peerReset     chan struct{} // closed on peer reset
 	readErr       error         // sticky read error; owned by transportResponseBody.Read
+	priority      PriorityParam // written on the stream's HEADERS frames
 	req           *http.Request
 	requestedGzip bool
 	resc          chan resAndError
@@ -1288,9 +1354,11 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 		}
 	}()
 
+	cs.priority = cc.streamPriority(cs)
+
 	cc.wmu.Lock()
 	endStream := !hasBody && !hasTrailers
-	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, cs.priority)
 	cc.wmu.Unlock()
 	traceWroteHeaders(cs.trace)
 	cc.mu.Unlock()
@@ -1460,7 +1528,7 @@ func (cc *ClientConn) awaitOpenSlotForRequest(req *http.Request) error {
 }
 
 // requires cc.wmu be held
-func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
+func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte, priority PriorityParam) error {
 	first := true // first frame written (HEADERS is first, then CONTINUATION)
 	for len(hdrs) > 0 && cc.werr == nil {
 		chunk := hdrs
@@ -1470,22 +1538,12 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
-			defaultHeaderPriorityParam := PriorityParam{
-				Exclusive: true,
-				Weight:    255,
-				StreamDep: 0,
-			}
-
-			if cc.t.HeaderPriority != nil {
-				defaultHeaderPriorityParam = *cc.t.HeaderPriority
-			}
-
 			cc.fr.WriteHeaders(HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
-				Priority:      defaultHeaderPriorityParam,
+				Priority:      priority,
 			})
 			first = false
 		} else {
@@ -1691,7 +1749,7 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 	// Two ways to send END_STREAM: either with trailers, or
 	// with an empty DATA frame.
 	if len(trls) > 0 {
-		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls)
+		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls, cs.priority)
 	} else {
 		err = cc.fr.WriteData(cs.ID, true, nil)
 	}
@@ -2068,6 +2126,7 @@ func (cc *ClientConn) streamByID(id uint32, andRemove bool) *clientStream {
 	if andRemove && cs != nil && !cc.closed {
 		cc.lastActive = time.Now()
 		delete(cc.streams, id)
+		cc.forgetStreamPriority(id)
 		if len(cc.streams) == 0 && cc.idleTimer != nil {
 			cc.idleTimer.Reset(cc.idleTimeout)
 			cc.lastIdle = time.Now()
