@@ -3382,6 +3382,13 @@ func TestTransportCloseAfterLostPing(t *testing.T) {
 	clientDone := make(chan struct{})
 	ct := newClientTester(t)
 	pingFailure := make(chan error, 1)
+	pingDetails := make(chan HealthCheckFailureDetails, 1)
+	ct.tr.OnHealthCheckFailureDetails = func(conn net.Conn, err error, details HealthCheckFailureDetails) {
+		if conn != ct.cc || !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("health check details callback = (%v, %v)", conn, err)
+		}
+		pingDetails <- details
+	}
 	ct.tr.OnHealthCheckFailure = func(conn net.Conn, err error) {
 		if conn != ct.cc {
 			t.Errorf("health check connection = %v, want %v", conn, ct.cc)
@@ -3405,6 +3412,15 @@ func TestTransportCloseAfterLostPing(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			return errors.New("health check failure callback was not called")
+		}
+		select {
+		case details := <-pingDetails:
+			if details.Phase != "ack_wait" || !details.PingWriteCompleted || details.DeadlineExpiredBeforeAckWait ||
+				details.ActiveStreamsAtStart != 1 || details.ActiveStreamsAtFailure != 1 || details.AckWait < ct.tr.PingTimeout/2 {
+				return fmt.Errorf("unexpected health check details: %+v", details)
+			}
+		case <-time.After(5 * time.Second):
+			return errors.New("health check details callback was not called")
 		}
 		return nil
 	}
@@ -3508,6 +3524,9 @@ func testTransportPingWhenReading(t *testing.T, readIdleTimeout, serverResponseI
 	ct.tr.ReadIdleTimeout = readIdleTimeout
 	ct.tr.OnHealthCheckFailure = func(_ net.Conn, err error) {
 		t.Errorf("unexpected health check failure: %v", err)
+	}
+	ct.tr.OnHealthCheckFailureDetails = func(_ net.Conn, err error, details HealthCheckFailureDetails) {
+		t.Errorf("unexpected health check failure details: %v (%+v)", err, details)
 	}
 	// guards the ct.fr.Write
 	var wmu sync.Mutex
