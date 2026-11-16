@@ -161,3 +161,75 @@ func TestTransportPriorityDependencies(t *testing.T) {
 	}
 	ct.run()
 }
+
+func TestTransportHeaderPriorityLargeHeaderBlock(t *testing.T) {
+	cookie := make([]byte, 3*initialMaxFrameSize)
+	for i := range cookie {
+		cookie[i] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[(i*7919)%62]
+	}
+
+	ct := newClientTester(t)
+	ct.tr.HeaderPriority = &PriorityParam{Exclusive: true, Weight: 255}
+	ct.fr.SetMaxReadFrameSize(initialMaxFrameSize)
+
+	ct.client = func() error {
+		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+		req.Header.Set("Cookie", string(cookie))
+		res, err := ct.tr.RoundTrip(req)
+		if err != nil {
+			return err
+		}
+		return res.Body.Close()
+	}
+	ct.server = func() error {
+		ct.greet()
+		var block []byte
+		var streamID uint32
+		for {
+			f, err := ct.fr.ReadFrame()
+			if err != nil {
+				return err
+			}
+			switch f := f.(type) {
+			case *HeadersFrame:
+				if f.Priority.IsZero() {
+					return fmt.Errorf("HEADERS frame has no priority")
+				}
+				streamID = f.StreamID
+				block = append(block, f.HeaderBlockFragment()...)
+				if f.HeadersEnded() {
+					return checkCookieAndRespond(ct, streamID, block, string(cookie))
+				}
+			case *ContinuationFrame:
+				block = append(block, f.HeaderBlockFragment()...)
+				if f.HeadersEnded() {
+					return checkCookieAndRespond(ct, streamID, block, string(cookie))
+				}
+			}
+		}
+	}
+	ct.run()
+}
+
+func checkCookieAndRespond(ct *clientTester, streamID uint32, block []byte, want string) error {
+	var got string
+	dec := hpack.NewDecoder(initialHeaderTableSize, func(hf hpack.HeaderField) {
+		if hf.Name == "cookie" {
+			got = hf.Value
+		}
+	})
+	if _, err := dec.Write(block); err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("cookie = %d bytes; want %d", len(got), len(want))
+	}
+	var buf bytes.Buffer
+	hpack.NewEncoder(&buf).WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	return ct.fr.WriteHeaders(HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: buf.Bytes(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+}

@@ -1557,8 +1557,14 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 	first := true // first frame written (HEADERS is first, then CONTINUATION)
 	for len(hdrs) > 0 && cc.werr == nil {
 		chunk := hdrs
-		if len(chunk) > maxFrameSize {
-			chunk = chunk[:maxFrameSize]
+		limit := maxFrameSize
+		if first && !priority.IsZero() {
+			// The priority section (stream dependency and weight) shares the
+			// HEADERS frame payload with the header block fragment.
+			limit -= 5
+		}
+		if len(chunk) > limit {
+			chunk = chunk[:limit]
 		}
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
