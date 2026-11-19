@@ -675,6 +675,10 @@ func (t *Transport) RoundTripOpt(req *http.Request, opt RoundTripOpt) (*http.Res
 	for retry := 0; ; retry++ {
 		cc, err := t.connPool().GetClientConn(req, addr)
 		if err != nil {
+			// Other acquisition errors may hand the unread body to a fallback.
+			if req.Body != nil && req.Context().Err() != nil {
+				req.Body.Close()
+			}
 			t.vlogf("http2: Transport failed to get client conn for %s: %v", addr, err)
 
 			return nil, err

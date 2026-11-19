@@ -87,6 +87,9 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 		}
 		return cc, nil
 	}
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
 	p.mu.Lock()
 	for _, cc := range p.conns[addr] {
 		if st := cc.idleState(); st.canTakeNewRequest {
@@ -104,7 +107,15 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 	traceGetConn(req, addr)
 	call := p.getStartDialLocked(req.Context(), addr)
 	p.mu.Unlock()
-	<-call.done
+	select {
+	case <-call.done:
+		// Cancellation must win even when the shared dial has also finished.
+		if err := req.Context().Err(); err != nil {
+			return nil, err
+		}
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
 	return call.res, call.err
 }
 
