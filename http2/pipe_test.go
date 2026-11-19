@@ -140,3 +140,46 @@ func TestPipeBreakWithError(t *testing.T) {
 		t.Errorf("Read() after close\ngot %v, nil\nwant 0, not nil", n)
 	}
 }
+
+func TestPipeSetBufferAfterClose(t *testing.T) {
+	tests := []struct {
+		name  string
+		close func(p *pipe, err error)
+	}{
+		{"CloseWithError", func(p *pipe, err error) { p.CloseWithError(err) }},
+		{"BreakWithError", func(p *pipe, err error) { p.BreakWithError(err) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var p pipe
+			wantErr := errors.New("closed early")
+			tt.close(&p, wantErr)
+			done := p.Done()
+			p.setBuffer(new(bytes.Buffer))
+
+			if p.b != nil {
+				t.Fatalf("buffer should remain nil after %s", tt.name)
+			}
+			if p.Done() != done {
+				t.Fatalf("Done() channel changed after setBuffer")
+			}
+			select {
+			case <-done:
+			default:
+				t.Fatalf("Done() channel should be closed after setBuffer")
+			}
+			if p.Err() != wantErr {
+				t.Fatalf("Err() = %v, want %v", p.Err(), wantErr)
+			}
+			if p.Len() != 0 {
+				t.Fatalf("Len() = %d, want 0", p.Len())
+			}
+			if n, err := p.Write([]byte("abc")); err != errClosedPipeWrite || n != 0 {
+				t.Fatalf("Write() = (%d, %v), want (0, %v)", n, err, errClosedPipeWrite)
+			}
+			if n, err := p.Read(make([]byte, 1)); err != wantErr || n != 0 {
+				t.Fatalf("Read() = (%d, %v), want (0, %v)", n, err, wantErr)
+			}
+		})
+	}
+}
