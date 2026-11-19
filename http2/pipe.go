@@ -30,6 +30,18 @@ type pipeBuffer interface {
 	io.Reader
 }
 
+func (p *pipe) setBuffer(b pipeBuffer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.b != nil {
+		panic("pipe buffer already set")
+	}
+	if p.err != nil || p.breakErr != nil {
+		return
+	}
+	p.b = b
+}
+
 func (p *pipe) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()

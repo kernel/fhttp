@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -421,6 +422,113 @@ func TestTransportPausedBodiesDoNotExhaustConnectionWindow(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("fourth response body remained blocked behind paused bodies")
+	}
+
+	cc.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after client connection closed")
+	}
+}
+
+// TestTransportBufferedUnreadBytesRaceWithHandleResponse exercises concurrent
+// ClientConn.BufferedUnreadBytes reads while handleResponse initializes
+// response pipes on the same HTTP/2 connection.
+func TestTransportBufferedUnreadBytesRaceWithHandleResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		s := &Server{}
+		s.ServeConn(conn, &ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("response payload"))
+		})})
+	}()
+
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+
+	tr := &Transport{
+		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+	}
+	cc, err := tr.NewClientConn(rawConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+
+	stop := make(chan struct{})
+	var pollerWG sync.WaitGroup
+	pollerWG.Add(1)
+	go func() {
+		defer pollerWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = cc.BufferedUnreadBytes()
+			}
+		}
+	}()
+
+	const (
+		workers  = 4
+		requests = 50
+	)
+	var reqWG sync.WaitGroup
+	errCh := make(chan error, workers*requests)
+	for w := 0; w < workers; w++ {
+		reqWG.Add(1)
+		go func(worker int) {
+			defer reqWG.Done()
+			for i := 0; i < requests; i++ {
+				req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://example.test/r/%d/%d", worker, i), nil)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				resp, err := cc.RoundTrip(req)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				_, err = io.Copy(io.Discard, resp.Body)
+				closeErr := resp.Body.Close()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if closeErr != nil {
+					errCh <- closeErr
+					return
+				}
+			}
+		}(w)
+	}
+
+	reqWG.Wait()
+	close(stop)
+	pollerWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
 	}
 
 	cc.Close()

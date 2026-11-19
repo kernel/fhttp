@@ -140,3 +140,49 @@ func TestPipeBreakWithError(t *testing.T) {
 		t.Errorf("Read() after close\ngot %v, nil\nwant 0, not nil", n)
 	}
 }
+
+func TestPipeSetBufferAfterClose(t *testing.T) {
+	var p pipe
+	closeErr := errors.New("closed early")
+	p.CloseWithError(closeErr)
+	p.setBuffer(new(bytes.Buffer))
+
+	if p.b != nil {
+		t.Fatalf("buffer should remain nil after CloseWithError")
+	}
+	if p.Err() != closeErr {
+		t.Fatalf("Err() = %v, want %v", p.Err(), closeErr)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("Len() = %d, want 0", p.Len())
+	}
+	if n, err := p.Write([]byte("abc")); err != errClosedPipeWrite || n != 0 {
+		t.Fatalf("Write() = (%d, %v), want (0, %v)", n, err, errClosedPipeWrite)
+	}
+	if n, err := p.Read(make([]byte, 1)); err != closeErr || n != 0 {
+		t.Fatalf("Read() = (%d, %v), want (0, %v)", n, err, closeErr)
+	}
+}
+
+func TestPipeSetBufferAfterBreak(t *testing.T) {
+	var p pipe
+	breakErr := errors.New("broken early")
+	p.BreakWithError(breakErr)
+	p.setBuffer(new(bytes.Buffer))
+
+	if p.b != nil {
+		t.Fatalf("buffer should remain nil after BreakWithError")
+	}
+	if p.Err() != breakErr {
+		t.Fatalf("Err() = %v, want %v", p.Err(), breakErr)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("Len() = %d, want 0", p.Len())
+	}
+	if n, err := p.Write([]byte("abc")); err != errClosedPipeWrite || n != 0 {
+		t.Fatalf("Write() = (%d, %v), want (0, %v)", n, err, errClosedPipeWrite)
+	}
+	if n, err := p.Read(make([]byte, 1)); err != breakErr || n != 0 {
+		t.Fatalf("Read() = (%d, %v), want (0, %v)", n, err, breakErr)
+	}
+}
