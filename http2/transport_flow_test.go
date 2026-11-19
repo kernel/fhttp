@@ -6,6 +6,8 @@ package http2
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +18,7 @@ import (
 
 	http "github.com/kernel/fhttp"
 	"github.com/kernel/fhttp/http2/hpack"
+	"github.com/kernel/fhttp/httptrace"
 )
 
 // throttledSink caps the rate at which a response body is consumed, simulating
@@ -474,6 +477,8 @@ func TestTransportBufferedUnreadBytesRaceWithHandleResponse(t *testing.T) {
 	defer cc.Close()
 
 	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopPoller := func() { stopOnce.Do(func() { close(stop) }) }
 	var pollerWG sync.WaitGroup
 	pollerWG.Add(1)
 	go func() {
@@ -487,10 +492,17 @@ func TestTransportBufferedUnreadBytesRaceWithHandleResponse(t *testing.T) {
 			}
 		}
 	}()
+	defer func() {
+		stopPoller()
+		pollerWG.Wait()
+	}()
 
 	const (
-		workers  = 4
-		requests = 50
+		workers        = 4
+		requests       = 50
+		requestTimeout = 5 * time.Second
+		phaseTimeout   = 10 * time.Second
+		want           = "response payload"
 	)
 	var reqWG sync.WaitGroup
 	errCh := make(chan error, workers*requests)
@@ -499,18 +511,22 @@ func TestTransportBufferedUnreadBytesRaceWithHandleResponse(t *testing.T) {
 		go func(worker int) {
 			defer reqWG.Done()
 			for i := 0; i < requests; i++ {
-				req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://example.test/r/%d/%d", worker, i), nil)
+				ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://example.test/r/%d/%d", worker, i), nil)
 				if err != nil {
+					cancel()
 					errCh <- err
 					return
 				}
 				resp, err := cc.RoundTrip(req)
 				if err != nil {
+					cancel()
 					errCh <- err
 					return
 				}
-				_, err = io.Copy(io.Discard, resp.Body)
+				body, err := io.ReadAll(resp.Body)
 				closeErr := resp.Body.Close()
+				cancel()
 				if err != nil {
 					errCh <- err
 					return
@@ -519,19 +535,185 @@ func TestTransportBufferedUnreadBytesRaceWithHandleResponse(t *testing.T) {
 					errCh <- closeErr
 					return
 				}
+				if string(body) != want {
+					errCh <- fmt.Errorf("response body = %q; want %q", body, want)
+					return
+				}
 			}
 		}(w)
 	}
 
-	reqWG.Wait()
-	close(stop)
+	reqDone := make(chan struct{})
+	go func() {
+		reqWG.Wait()
+		close(reqDone)
+	}()
+	select {
+	case <-reqDone:
+	case <-time.After(phaseTimeout):
+		t.Error("requests did not complete before the phase deadline")
+		cc.Close()
+		rawConn.Close()
+		select {
+		case <-reqDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("request goroutines did not stop after closing the connection")
+		}
+	}
+	stopPoller()
 	pollerWG.Wait()
 	close(errCh)
 	for err := range errCh {
-		t.Fatal(err)
+		t.Error(err)
 	}
 
 	cc.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after client connection closed")
+	}
+}
+
+// TestTransportCloseBeforeHandleResponsePreservesPipeError deterministically
+// closes the connection after the stream has been found by processHeaders but
+// before handleResponse initializes cs.bufPipe, and verifies the close error
+// is preserved and no buffer is installed on the already-closed pipe.
+func TestTransportCloseBeforeHandleResponsePreservesPipeError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		s := &Server{}
+		s.ServeConn(conn, &ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("response payload"))
+		})})
+	}()
+
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+
+	tr := &Transport{
+		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+	}
+	cc, err := tr.NewClientConn(rawConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+
+	const timeout = 5 * time.Second
+	sentinelErr := errors.New("sentinel close error")
+
+	atFirstByte := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseFn()
+	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			once.Do(func() {
+				close(atFirstByte)
+				<-release
+			})
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, "https://example.test/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		resp    *http.Response
+		err     error
+		bodyErr error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		resp, err := cc.RoundTrip(req)
+		r := result{resp: resp, err: err}
+		if err == nil {
+			_, r.bodyErr = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
+		resCh <- r
+	}()
+
+	select {
+	case <-atFirstByte:
+	case <-time.After(timeout):
+		cc.Close()
+		t.Fatal("timed out waiting for GotFirstResponseByte")
+	}
+
+	// The read loop is paused right before handleResponse. Confirm the
+	// stream is registered, then close the connection under it.
+	var cs *clientStream
+	cc.mu.Lock()
+	for _, s := range cc.streams {
+		cs = s
+	}
+	n := len(cc.streams)
+	cc.mu.Unlock()
+	if n != 1 || cs == nil {
+		releaseFn()
+		cc.Close()
+		t.Fatalf("len(cc.streams) = %d; want 1 stream registered", n)
+	}
+
+	cc.closeForError(sentinelErr)
+	releaseFn()
+
+	select {
+	case r := <-resCh:
+		if r.err != sentinelErr {
+			t.Errorf("RoundTrip error = %v; want %v", r.err, sentinelErr)
+		}
+		if r.err == nil && r.bodyErr != sentinelErr {
+			t.Errorf("body read error = %v; want %v", r.bodyErr, sentinelErr)
+		}
+	case <-time.After(timeout):
+		cc.Close()
+		t.Fatal("RoundTrip did not return after connection close")
+	}
+
+	// Wait for the read loop to finish processing the paused headers
+	// (including handleResponse) before inspecting the pipe.
+	select {
+	case <-cc.readerDone:
+	case <-time.After(timeout):
+		t.Fatal("read loop did not exit after connection close")
+	}
+
+	if got := cs.bufPipe.Err(); got != sentinelErr {
+		t.Errorf("cs.bufPipe.Err() = %v; want %v", got, sentinelErr)
+	}
+	cs.bufPipe.mu.Lock()
+	buf := cs.bufPipe.b
+	cs.bufPipe.mu.Unlock()
+	if buf != nil {
+		t.Errorf("cs.bufPipe.b = %v; want nil after close before handleResponse", buf)
+	}
+
 	select {
 	case <-serverDone:
 	case <-time.After(2 * time.Second):

@@ -30,6 +30,9 @@ type pipeBuffer interface {
 	io.Reader
 }
 
+// setBuffer installs b as the pipe's buffer. It is a one-time operation:
+// b must be a non-nil, empty buffer, and setBuffer panics if p.b is already
+// set. It is a no-op if the pipe is already closed or broken.
 func (p *pipe) setBuffer(b pipeBuffer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -95,7 +98,8 @@ func (p *pipe) Write(d []byte) (n int, err error) {
 	if p.err != nil || p.breakErr != nil {
 		return 0, errClosedPipeWrite
 	}
-	// pipe.setBuffer is never invoked, leaving the buffer uninitialized.
+	// Write can be reached before setBuffer installs a buffer (for example,
+	// if data arrives without an initialized pipe buffer).
 	// We shouldn't try to write to an uninitialized pipe,
 	// but returning an error is better than panicking.
 	if p.b == nil {
