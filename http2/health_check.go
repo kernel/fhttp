@@ -1,6 +1,20 @@
 package http2
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+const lostPingMessage = "http2: client connection lost"
+
+// PingAckTimeoutError is returned to streams interrupted by a health check
+// whose PING was flushed but not acknowledged before its deadline. Deadline
+// belongs to the connection's PING, not to any individual request.
+type PingAckTimeoutError struct {
+	Deadline time.Time
+}
+
+func (PingAckTimeoutError) Error() string { return lostPingMessage }
 
 // HealthCheckFailureDetails describes a failed health-check PING. Timings are
 // retrospective and do not impose deadlines on the write lock or socket writes.
@@ -21,8 +35,18 @@ type HealthCheckFailureDetails struct {
 	// DeadlineExpiredBeforeAckWait distinguishes a deadline consumed before
 	// waiting for the ACK from one that expires during the wait.
 	DeadlineExpiredBeforeAckWait bool
+	// AckTimeoutAt is the PING deadline if it expired while waiting for the
+	// ACK, or zero for other failures, including a timeout on the reader.
+	AckTimeoutAt time.Time
 	// ActiveStreamsAtStart is sampled before attempting the PING.
 	ActiveStreamsAtStart int
 	// ActiveStreamsAtFailure is sampled before closing the failed connection.
 	ActiveStreamsAtFailure int
+}
+
+func (d HealthCheckFailureDetails) streamError() error {
+	if !d.AckTimeoutAt.IsZero() {
+		return PingAckTimeoutError{Deadline: d.AckTimeoutAt}
+	}
+	return errors.New(lostPingMessage)
 }

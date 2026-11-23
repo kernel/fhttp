@@ -1010,7 +1010,7 @@ func (cc *ClientConn) healthCheck() {
 		details.ActiveStreamsAtFailure = len(cc.streams)
 		cc.mu.Unlock()
 		details.TotalDuration = time.Since(started)
-		cc.closeForLostPing()
+		cc.closeForError(details.streamError())
 		cc.t.connPool().MarkDead(cc)
 		if cc.t.OnHealthCheckFailure != nil {
 			cc.t.OnHealthCheckFailure(cc.tconn, err)
@@ -1243,13 +1243,6 @@ func (cc *ClientConn) closeForError(err error) error {
 // In-flight requests are interrupted. For a graceful shutdown, use Shutdown instead.
 func (cc *ClientConn) Close() error {
 	err := errors.New("http2: client connection force closed via ClientConn.Close")
-
-	return cc.closeForError(err)
-}
-
-// closes the client connection immediately. In-flight requests are interrupted.
-func (cc *ClientConn) closeForLostPing() error {
-	err := errors.New("http2: client connection lost")
 
 	return cc.closeForError(err)
 }
@@ -2970,14 +2963,18 @@ func (cc *ClientConn) ping(ctx context.Context) (details HealthCheckFailureDetai
 		return details, err
 	}
 	details.PingWriteCompleted = true
-	details.DeadlineExpiredBeforeAckWait = errors.Is(ctx.Err(), context.DeadlineExceeded)
 	details.Phase = "ack_wait"
 	ackStarted := time.Now()
+	deadline, hasDeadline := ctx.Deadline()
+	details.DeadlineExpiredBeforeAckWait = hasDeadline && !ackStarted.Before(deadline)
 	defer func() { details.AckWait = time.Since(ackStarted) }()
 	select {
 	case <-c:
 		return details, nil
 	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded && !details.DeadlineExpiredBeforeAckWait {
+			details.AckTimeoutAt = deadline
+		}
 		return details, ctx.Err()
 	case <-cc.readerDone:
 		// connection closed
