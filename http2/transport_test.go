@@ -3402,8 +3402,10 @@ func TestTransportCloseAfterLostPing(t *testing.T) {
 		defer close(clientDone)
 		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
 		_, err := ct.tr.RoundTrip(req)
-		if err == nil || !strings.Contains(err.Error(), "client connection lost") {
-			return fmt.Errorf("expected to get error about \"connection lost\", got %v", err)
+		var timeout PingAckTimeoutError
+		if !errors.As(err, &timeout) || timeout.Deadline.IsZero() || timeout.Deadline.After(time.Now()) ||
+			err.Error() != "http2: client connection lost" || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("stream error = %T %v, deadline %v", err, err, timeout.Deadline)
 		}
 		select {
 		case err := <-pingFailure:
@@ -3415,7 +3417,7 @@ func TestTransportCloseAfterLostPing(t *testing.T) {
 		}
 		select {
 		case details := <-pingDetails:
-			if details.Phase != "ack_wait" || !details.PingWriteCompleted || details.DeadlineExpiredBeforeAckWait ||
+			if !details.AckTimeoutAt.Equal(timeout.Deadline) || details.Phase != "ack_wait" || !details.PingWriteCompleted || details.DeadlineExpiredBeforeAckWait ||
 				details.ActiveStreamsAtStart != 1 || details.ActiveStreamsAtFailure != 1 || details.AckWait < ct.tr.PingTimeout/2 {
 				return fmt.Errorf("unexpected health check details: %+v", details)
 			}

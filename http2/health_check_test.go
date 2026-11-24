@@ -22,6 +22,13 @@ func newPingTestConn(writer io.Writer) *ClientConn {
 }
 
 func TestPingFailureDetails(t *testing.T) {
+	checkNotAckTimeout := func(t *testing.T, details HealthCheckFailureDetails) {
+		t.Helper()
+		var timeout PingAckTimeoutError
+		if err := details.streamError(); errors.As(err, &timeout) || err.Error() != "http2: client connection lost" {
+			t.Fatalf("unexpected stream error: %T %v", err, err)
+		}
+	}
 	t.Run("flush failure", func(t *testing.T) {
 		cause := errors.New("write failed")
 		cc := newPingTestConn(pingWriteFunc(func([]byte) (int, error) { return 0, cause }))
@@ -29,17 +36,36 @@ func TestPingFailureDetails(t *testing.T) {
 		if err != cause || details.Phase != "flush" || details.PingWriteCompleted || details.AckWait != 0 {
 			t.Fatalf("ping = (%+v, %v)", details, err)
 		}
+		checkNotAckTimeout(t, details)
 		if details.WriteDuration <= 0 || details.TotalDuration < details.WriteDuration {
 			t.Fatalf("invalid durations: %+v", details)
 		}
 	})
 	t.Run("reader failure", func(t *testing.T) {
-		cc := newPingTestConn(io.Discard)
-		cc.readerErr = io.EOF
-		close(cc.readerDone)
-		details, err := cc.ping(context.Background())
-		if err != io.EOF || details.Phase != "ack_wait" || !details.PingWriteCompleted || details.DeadlineExpiredBeforeAckWait {
-			t.Fatalf("ping = (%+v, %v)", details, err)
+		for _, cause := range []error{io.EOF, context.DeadlineExceeded} {
+			cc := newPingTestConn(io.Discard)
+			cc.readerErr = cause
+			close(cc.readerDone)
+			details, err := cc.ping(context.Background())
+			checkNotAckTimeout(t, details)
+			if err != cause || details.Phase != "ack_wait" || !details.PingWriteCompleted || details.DeadlineExpiredBeforeAckWait {
+				t.Fatalf("ping = (%+v, %v)", details, err)
+			}
+		}
+	})
+	t.Run("deadline wins a tie", func(t *testing.T) {
+		for _, signal := range []string{"ack", "reader"} {
+			t.Run(signal, func(t *testing.T) {
+				ack, readerDone := make(chan struct{}), make(chan struct{})
+				if signal == "ack" {
+					close(ack)
+				} else {
+					close(readerDone)
+				}
+				var details HealthCheckFailureDetails
+				details.noteAckDeadline(time.Now(), ack, readerDone)
+				checkNotAckTimeout(t, details)
+			})
 		}
 	})
 	t.Run("blocked flush", func(t *testing.T) {
@@ -53,6 +79,7 @@ func TestPingFailureDetails(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) || !details.PingWriteCompleted || !details.DeadlineExpiredBeforeAckWait {
 			t.Fatalf("ping = (%+v, %v)", details, err)
 		}
+		checkNotAckTimeout(t, details)
 		if details.WriteDuration < 15*time.Millisecond || details.Phase != "ack_wait" {
 			t.Fatalf("blocked flush was not measured: %+v", details)
 		}
@@ -84,6 +111,7 @@ func TestPingFailureDetails(t *testing.T) {
 		cc.wmu.Unlock()
 		select {
 		case details := <-result:
+			checkNotAckTimeout(t, details)
 			if details.WriteLockWait < 15*time.Millisecond || !details.PingWriteCompleted || !details.DeadlineExpiredBeforeAckWait {
 				t.Fatalf("blocked write lock was not measured: %+v", details)
 			}
