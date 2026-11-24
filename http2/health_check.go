@@ -44,6 +44,21 @@ type HealthCheckFailureDetails struct {
 	ActiveStreamsAtFailure int
 }
 
+// A deadline can win the select in ping even when the ACK or a read failure
+// is ready. Keep the caller's deadline error, but don't attribute those ties
+// to an unanswered PING.
+func (d *HealthCheckFailureDetails) noteAckDeadline(deadline time.Time, ack, readerDone <-chan struct{}) {
+	if d.DeadlineExpiredBeforeAckWait {
+		return
+	}
+	select {
+	case <-ack:
+	case <-readerDone:
+	default:
+		d.AckTimeoutAt = deadline
+	}
+}
+
 func (d HealthCheckFailureDetails) streamError() error {
 	if !d.AckTimeoutAt.IsZero() {
 		return PingAckTimeoutError{Deadline: d.AckTimeoutAt}

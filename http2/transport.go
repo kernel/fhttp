@@ -2972,10 +2972,11 @@ func (cc *ClientConn) ping(ctx context.Context) (details HealthCheckFailureDetai
 	case <-c:
 		return details, nil
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded && !details.DeadlineExpiredBeforeAckWait {
-			details.AckTimeoutAt = deadline
+		err := ctx.Err()
+		if err == context.DeadlineExceeded {
+			details.noteAckDeadline(deadline, c, cc.readerDone)
 		}
-		return details, ctx.Err()
+		return details, err
 	case <-cc.readerDone:
 		// connection closed
 		return details, cc.readerErr

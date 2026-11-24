@@ -53,6 +53,21 @@ func TestPingFailureDetails(t *testing.T) {
 			}
 		}
 	})
+	t.Run("deadline wins a tie", func(t *testing.T) {
+		for _, signal := range []string{"ack", "reader"} {
+			t.Run(signal, func(t *testing.T) {
+				ack, readerDone := make(chan struct{}), make(chan struct{})
+				if signal == "ack" {
+					close(ack)
+				} else {
+					close(readerDone)
+				}
+				var details HealthCheckFailureDetails
+				details.noteAckDeadline(time.Now(), ack, readerDone)
+				checkNotAckTimeout(t, details)
+			})
+		}
+	})
 	t.Run("blocked flush", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 		defer cancel()
